@@ -28,6 +28,32 @@ single bash script that:
 - **restarts itself** if mpv dies mid-song (expired stream, 403, dropped network)
   instead of silently dropping you back to the shell
 
+## Install
+
+One command. It installs everything it needs and then the player itself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/piyushkghosh/music/main/install.sh | bash
+```
+
+Or from a clone:
+
+```sh
+git clone https://github.com/piyushkghosh/music.git
+cd music && ./install.sh
+```
+
+The script:
+
+- installs any missing system packages (`mpv`, `socat`, `jq`) with
+  `apt`/`dnf`/`yum`/`pacman`/`zypper`/`apk`/`brew`, asking for `sudo` if needed
+- installs `yt-dlp` as a self-updating binary in `~/.local/bin` (no root),
+  falling back to `pipx`/`pip --user`
+- installs `music` to `~/.local/bin` — even if a dependency could not be
+  installed, so the player is never withheld
+
+Overrides: `PREFIX=/some/bin ./install.sh` to change the install directory.
+
 ## Requirements
 
 | tool | why |
@@ -37,25 +63,8 @@ single bash script that:
 | `socat` | talks to mpv over its JSON IPC socket |
 | `jq` | parses the IPC replies |
 
-Ubuntu/Debian:
-
-```sh
-sudo apt install mpv socat jq pipx
-pipx install yt-dlp        # or: pip install --user -U yt-dlp
-```
-
-`yt-dlp` goes stale fast. Update it when YouTube breaks: `yt-dlp -U`.
-
-## Install
-
-```sh
-git clone https://github.com/piyushkghosh/music.git
-cd music
-./install.sh
-```
-
-That copies the script to `~/.local/bin/music` (make sure that is on your
-`PATH`). Or just `cp music ~/.local/bin/` yourself — there is no build step.
+Installed automatically; listed here so you know what is on your machine.
+`yt-dlp` goes stale fast — if playback stops working, `yt-dlp -U`.
 
 ## Usage
 
