@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# music - stream YouTube audio from the terminal. Nothing is written to disk.
+#
+#   music <terms>          play now, keeps loading songs in the background
+#   music --date <terms>   same, but most recent uploads first
+#   music q <terms>        queue another search into the running player
+#   music stop             stop the player
+#
+# While music is running:
+#   n / RIGHT   next          p / LEFT   previous      SPACE  pause/resume
+#   m           mute          1 2 3 9    playback speed (1x 2x 3x slower)
+#   :           command line - type  :mq <terms>  to search and queue more songs
+#   q           quit music and come back to the shell
+#
+# Requires: mpv, yt-dlp, socat, jq
+#
+# Environment:
+#   MUSIC_VOL=70      playback volume
+#   MUSIC_FMT=251     yt-dlp audio format preference (251/140/b by default)
+#   MUSIC_FILTER=1    enable the optional ffmpeg filter chain
+#   MUSIC_LOG=<file>  send mpv output to a file instead of ~/.cache/music/mpv.log
+
+MUSIC_DIR="$HOME/.cache/music"
+MUSIC_SOCK="$MUSIC_DIR/mpv.sock"
+MUSIC_TITLES="$MUSIC_DIR/titles"
+MUSIC_WIN=10                # songs kept queued ahead of the current one
+MUSIC_TOTAL=30              # most results pulled per search
+
+# prefer a self-updated yt-dlp in ~/.local/bin, fall back to PATH
+if [ -x "$HOME/.local/bin/yt-dlp" ]; then
+  MUSIC_YTDLP="$HOME/.local/bin/yt-dlp"
+else
+  MUSIC_YTDLP="$(command -v yt-dlp || echo yt-dlp)"
+fi
+
+# build a YouTube search target for the given terms
+music_target() {
+  local latest=0
+  [ "$1" = "--date" ] && { latest=1; shift; }
+  [ $# -eq 0 ] && return 1
+  if [ "$latest" = 1 ]; then
+    printf 'https://www.youtube.com/results?search_query=%s&sp=EgIIAhgB\n' \
+      "$(printf '%s' "$*" | tr -s ' ' | tr ' ' '+')"
+  else
+    printf 'ytsearch%s:%s\n' "$MUSIC_TOTAL" "$(printf '%s' "$*" | tr -s ' ')"
+  fi
+}
+
+# ask mpv something over its IPC socket: music_ipc '["get_property","playlist-count"]'
+music_ipc() {
+  printf '{"command":%s,"request_id":1}\n' "$1" |
+    socat -T3 - UNIX-CONNECT:"$MUSIC_SOCK" 2>/dev/null | jq -r '.data // empty' 2>/dev/null
+}
+
+# a socket file outlives mpv if it died, so check the process too
+music_alive() {
+  [ -S "$MUSIC_SOCK" ] || return 1
+  pgrep -f "input-ipc-server=$MUSIC_SOCK" >/dev/null 2>&1
+}
+
+# stop a player that is still running in the background (also clears stale state)
+musicstop() {
+  pkill -f "input-ipc-server=$MUSIC_SOCK" 2>/dev/null
+  pkill -f "$MUSIC_TITLES" 2>/dev/null
+  sleep 0.3
+  rm -f "$MUSIC_SOCK" "$MUSIC_DIR/seed.m3u8" "$MUSIC_TITLES"
+  printf 'music stopped\n'
+}
+
+# background loader: resolve <target> in chunks of 5 and append each song to the
+# live queue over IPC, throttled to keep ~$MUSIC_WIN songs ahead of playback.
+# usage: music_enqueue <target> [skip-first]
+music_enqueue() {
+  local target=$1 skip=${2:-0}
+  (
+    start=1
+    while [ "$start" -lt "$MUSIC_TOTAL" ]; do
+      [ -S "$MUSIC_SOCK" ] || exit 0
+      end=$(( start + 4 ))
+      "$MUSIC_YTDLP" --no-playlist --skip-download \
+          -f "${MUSIC_FMT:-251}/140/b" --playlist-start "$start" --playlist-end "$end" \
+          --print '%(title)s	%(duration_string)s	%(webpage_url)s' "$target" 2>/dev/null |
+      while IFS=$'\t' read -r title durstr url; do
+        case "$url" in https://*) ;; *) continue ;; esac
+        [ "$skip" = 1 ] && { skip=0; continue; }      # first result is already playing
+        grep -Fxq -- "$title" "$MUSIC_TITLES" 2>/dev/null && continue   # no duplicates
+        while :; do
+          [ -S "$MUSIC_SOCK" ] || exit 0
+          cnt=$(music_ipc '["get_property","playlist-count"]')
+          pos=$(music_ipc '["get_property","playlist-pos"]')
+          [ "$pos" = "null" ] && pos=0
+          case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+          case "$pos" in ''|*[!0-9]*) pos=0 ;; esac
+          [ $(( cnt - pos - 1 )) -lt "$MUSIC_WIN" ] && break
+          sleep 2
+        done
+        # append, and only record the title when mpv confirms it with a
+        # playlist_entry_id - otherwise the title list would drift out of sync
+        # with the playlist and songs would go missing from the display
+        resp=$(printf '{"command":["loadfile","%s","append"],"request_id":2}\n' "$url" |
+               socat -T5 - UNIX-CONNECT:"$MUSIC_SOCK" 2>/dev/null)
+        case "$resp" in
+          *playlist_entry_id*) printf '%s\n' "$title" >> "$MUSIC_TITLES" ;;
+        esac
+      done
+      start=$end
+    done
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null
+}
+
+# queue another search into the running player (also works from another terminal)
+musicq() {
+  if ! music_alive; then
+    printf 'no player running - start one with: music <terms>\n' >&2
+    return 1
+  fi
+  local target
+  target=$(music_target "$@") || { printf 'usage: musicq <search terms>\n' >&2; return 1; }
+  printf 'queuing: %s\n' "$*" >&2
+  music_enqueue "$target" 0
+}
+
+# the player UI. deliberately uses NO escape codes: it only ever appends new
+# lines, so it looks the same in any terminal (some pty/tmux setups print raw
+# escape codes instead of honouring them, which breaks in-place redraws).
+music_ui() {
+  local key pos cnt i cur tsec dur nxt
+  local shown_pos=0 cmdmode=0 line="" ch shown_next="@"
+  local saved_stty
+  saved_stty=$(stty -g 2>/dev/null) && stty -echo 2>/dev/null
+
+  printf 'keys:  n next  p prev  space pause  m mute  1/2/3/9 speed  : command  q quit\n\n'
+
+  while :; do
+    music_alive || break
+
+    pos=$(music_ipc '["get_property","playlist-pos"]')
+    cnt=$(music_ipc '["get_property","playlist-count"]')
+    [ "$pos" = "null" ] && pos=0
+    case "$pos" in ''|*[!0-9]*) pos=0 ;; esac
+    case "$cnt" in ''|*[!0-9]*) cnt=0 ;; esac
+    pos=$(( pos + 1 ))
+    mapfile -t titles < "$MUSIC_TITLES" 2>/dev/null
+    tsec=$(music_ipc '["get_property","playback-time"]')
+    case "$tsec" in ''|*[!0-9]*) tsec=0 ;; esac
+    dur=0
+    cur=${titles[pos-1]:-(loading...)}
+    cur=${cur%%$'\t'*}                       # titles file is "title<TAB>length"
+    curdur=${titles[pos-1]#*$'\t'}
+    [ "$curdur" = "${titles[pos-1]}" ] && curdur="--:--"
+
+    # a new song started: print its block once
+    if [ "$pos" != "$shown_pos" ]; then
+      [ "$shown_pos" != 0 ] && printf -- '--- skipped to %d ---\n' "$pos"
+      printf 'now playing %d/%d   %d:%02d / %s\n  %s\n' \
+        "$pos" "$cnt" $(( tsec / 60 )) $(( tsec % 60 )) "$curdur" "$cur"
+      shown_pos=$pos
+    fi
+
+    # the one song that matters: the next one. print it only when it changes,
+    # so the screen never fills up with a long list.
+    if [ "$pos" -lt "$cnt" ] && [ -n "${titles[pos]}" ]; then
+      nxt=${titles[pos]}
+      nxt=${nxt%%$'\t'*}                    # drop the length column
+    else
+      nxt=""
+    fi
+    if [ "$nxt" != "$shown_next" ]; then
+      if [ -z "$nxt" ]; then
+        printf '   (loading next song...)\n'
+      else
+        printf '   next: %s\n' "$nxt"
+      fi
+      shown_next=$nxt
+    fi
+
+    # read a key; got=0 means the 0.5s window expired with nothing typed
+    local got=1
+    IFS= read -rn1 -t 0.5 key || got=0
+
+    # --- command line: :  then type, Enter runs it -------------------------
+    if [ "$cmdmode" = 1 ]; then
+      if [ "$got" = 0 ]; then continue; fi     # nothing typed yet
+      if [ -z "$key" ]; then                     # Enter
+        printf '\n'
+        [ -n "$line" ] && { printf '> %s\n' "$line"; eval "$line" 2>&1 | sed 's/^/  /'; }
+        line=""; cmdmode=0
+      elif [ "$key" = $'\e' ] || [ "$key" = ':' ]; then
+        printf '\n(cancelled)\n'; line=""; cmdmode=0
+      elif [ "$key" = $'\177' ]; then
+        line="${line%?}"
+      elif [ -n "$key" ]; then
+        line="$line$key"; printf '%s' "$key"
+      fi
+      continue
+    fi
+
+    case "$key" in
+      '') ;;                                   # timed out: nothing typed
+      n|j)  music_ipc '["playlist-next","force"]' >/dev/null ;;
+      p|k)  music_ipc '["playlist-prev","force"]' >/dev/null ;;
+      ' ')  music_ipc '["cycle","pause"]' >/dev/null
+            printf '\n[pause]\n' ;;
+      m)    music_ipc '["cycle","mute"]' >/dev/null
+            printf '\n[mute]\n' ;;
+      1) music_ipc '["set_property","speed","1.0"]' >/dev/null; printf '\n[speed 1x]\n' ;;
+      2) music_ipc '["set_property","speed","2.0"]' >/dev/null; printf '\n[speed 2x]\n' ;;
+      3) music_ipc '["set_property","speed","3.0"]' >/dev/null; printf '\n[speed 3x]\n' ;;
+      9) music_ipc '["set_property","speed","0.5"]' >/dev/null; printf '\n[speed 0.5x]\n' ;;
+      ':') cmdmode=1; line=""; printf ': ' ;;
+      q) printf '\nstopped\n'; break ;;
+    esac
+  done
+
+  [ -n "$saved_stty" ] && stty "$saved_stty" 2>/dev/null
+}
+
+music() {
+  if [ $# -eq 0 ]; then
+    printf 'usage: music [--date] <search terms>\n  e.g. music arijit singh\n' >&2
+    return 1
+  fi
+  if music_alive; then
+    # a player is already going: stop it and take over with the new search
+    musicstop >/dev/null
+  fi
+  local target
+  target=$(music_target "$@") || { printf 'usage: music [--date] <search terms>\n' >&2; return 1; }
+
+  mkdir -p "$MUSIC_DIR"
+  rm -f "$MUSIC_SOCK" "$MUSIC_TITLES"
+  : > "$MUSIC_TITLES"
+
+  # resolve ONLY the first track so playback starts in a couple of seconds
+  printf 'searching: %s\n' "$*" >&2
+  local stitle sdur surl
+  { IFS=$'\t' read -r stitle sdur surl; } <<<"$("$MUSIC_YTDLP" --no-playlist --skip-download \
+             -f "${MUSIC_FMT:-251}/140/b" --playlist-end 1 \
+             --print '%(title)s	%(duration_string)s	%(webpage_url)s' "$target" 2>/dev/null | head -1)"
+  case "$surl" in
+    https://*) ;;
+    *) printf 'no results found\n' >&2; return 1 ;;
+  esac
+  printf '%s\n' "$surl" > "$MUSIC_DIR/seed.m3u8"
+  printf '%s\t%s\n' "$stitle" "$sdur" >> "$MUSIC_TITLES"
+
+  # Audio: by default NOTHING is applied - raw audio straight through mpv, exactly
+# like youtube-music-cli does (its mpv is launched with no --af unless you
+# configure one). Measured: our loudnorm/afftdn chain caused audible warble.
+  #   MUSIC_FILTER=1     turn processing ON (below)
+  #   MUSIC_NO_HP=1      drop the highpass
+  #   MUSIC_NO_DN=1      drop the FFT denoiser (afftdn)
+  #   MUSIC_NO_EQ=1      drop the two equalizer stages
+  #   MUSIC_NO_LN=1      drop loudnorm + alimiter (level pumping / warble)
+  #   MUSIC_DNR=<n>      denoise strength, default 12
+  #   MUSIC_FMT=<id>     yt-dlp format, default 251 (opus 131k); 140 = aac 129k
+  local extra=() af
+  if [ -n "$MUSIC_FILTER" ]; then
+    af="aresample=48000:resampler=soxr"
+    [ -z "$MUSIC_NO_HP" ] && af="$af,highpass=f=35"
+    [ -z "$MUSIC_NO_DN" ] && af="$af,afftdn=nr=${MUSIC_DNR:-12}:nf=-30"
+    [ -z "$MUSIC_NO_EQ" ] && af="$af,equalizer=f=180:t=q:w=1:g=1.5,equalizer=f=3000:t=q:w=1.5:g=2"
+    [ -z "$MUSIC_NO_LN" ] && af="$af,loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=limit=0.9"
+    extra=(--af="$af")
+  fi
+
+  # bash prints "[1] 12345" for every background job; hide it by parking stderr
+  # on fd 3 while the job is spawned
+  local mpvpid tries=0
+  while :; do
+    tries=$(( tries + 1 ))
+    exec 3>&2 2>/dev/null
+    mpv --playlist="$MUSIC_DIR/seed.m3u8" \
+        "${extra[@]}" \
+        --load-scripts=no \
+        --input-terminal=no \
+        --input-ipc-server="$MUSIC_SOCK" \
+        --audio-samplerate=48000 \
+        --cache=yes --cache-secs=30 --network-timeout=10 --gapless-audio=yes \
+        --volume="${MUSIC_VOL:-70}" \
+        --term-status-msg='' \
+        --msg-level='cplayer=error,playl=error' \
+        --idle=no --keep-open=no \
+        >"${MUSIC_LOG:-$MUSIC_DIR/mpv.log}" 2>&1 &
+    mpvpid=$!
+    disown 2>/dev/null
+    exec 2>&3 3>&-
+
+    # wait for the socket, then start filling the queue behind the first song
+    local i
+    for i in $(seq 1 40); do [ -S "$MUSIC_SOCK" ] && break; sleep 0.25; done
+    exec 3>&2 2>/dev/null
+    music_enqueue "$target" 1
+    exec 2>&3 3>&-
+
+    music_ui
+
+    # mpv still alive -> you pressed q, normal exit
+    kill -0 "$mpvpid" 2>/dev/null && break
+    # it died on its own (expired stream, 403, network): restart it
+    if [ "$tries" -lt 3 ]; then
+      printf '\nplayer stopped unexpectedly - restarting (%d/2)...\n' "$tries" >&2
+      tail -n 3 "${MUSIC_LOG:-$MUSIC_DIR/mpv.log}" 2>/dev/null | sed 's/^/  /' >&2
+      pkill -f "input-ipc-server=$MUSIC_SOCK" 2>/dev/null
+      rm -f "$MUSIC_SOCK"
+      sleep 2
+      continue
+    fi
+    printf '\nplayer keeps stopping. last errors from mpv:\n' >&2
+    tail -n 6 "${MUSIC_LOG:-$MUSIC_DIR/mpv.log}" 2>/dev/null | sed 's/^/  /' >&2
+    break
+  done
+
+  pkill -f "input-ipc-server=$MUSIC_SOCK" 2>/dev/null
+  rm -f "$MUSIC_SOCK" "$MUSIC_DIR/seed.m3u8" "$MUSIC_TITLES"
+  disown 2>/dev/null
+}
+case "${1:-}" in
+  q|queue)  shift; musicq "$@" ;;
+  stop)     musicstop ;;
+  *)        music "$@" ;;
+esac
